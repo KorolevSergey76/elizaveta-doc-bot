@@ -1,0 +1,5 @@
+.env
+.vscode
+.idea/
+*.exe
+bot_app
