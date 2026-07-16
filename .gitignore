@@ -1,5 +1,4 @@
 .env
-.vscode
-.idea/
-*.exe
-bot_app
+.DS_Store
+.cache/
+bot_bin

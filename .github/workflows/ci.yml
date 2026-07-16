@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get project code
+        uses: actions/checkout@v4
+
+      - name: Install the Go version from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l $(find . -name '*.go' -type f -not -path './.git/*'))"
+
+      - name: Find common Go mistakes
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test ./...
