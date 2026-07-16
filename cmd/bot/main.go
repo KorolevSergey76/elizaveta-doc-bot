@@ -1,94 +1,75 @@
 package main
 
 import (
+	"database/sql"
+	"fmt"
 	"log"
-	"time"
+	"os"
+
+	"cosmetologybotliza/internal/bot"
+	"cosmetologybotliza/internal/repository"
+	"cosmetologybotliza/internal/service"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
-
-	"cosmetologybotliza/internal/bot"
-	"cosmetologybotliza/internal/bot/admin"
-	"cosmetologybotliza/internal/bot/booking"
-	"cosmetologybotliza/internal/bot/menu"
-	"cosmetologybotliza/internal/config"
-	"cosmetologybotliza/internal/fsm"
-	"cosmetologybotliza/internal/service"
-	"cosmetologybotliza/internal/storage"
+	_ "github.com/lib/pq" // Драйвер базы данных
 )
 
 func main() {
-	// 1. Загрузка конфигурации: читаем переменные окружения (токен бота, параметры БД)
+	// 1. Загрузка переменных окружения
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using system env vars")
+		log.Println("Файл .env не найден, используем переменные среды системы")
 	}
-	cfg := config.NewConfig()
 
-	// 2. Инициализация хранилищ: создание подключений к базам данных
-	db := storage.NewPostgres(cfg) // База данных (услуги, пользователи, записи)
-	rdb := storage.NewRedis(cfg)   // Кэш/состояние (для FSM, чтобы помнить шаг записи)
+	// 2. Инициализация БД
+	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		os.Getenv("POSTGRES_HOST"),
+		os.Getenv("POSTGRES_PORT"),
+		os.Getenv("POSTGRES_USER"),
+		os.Getenv("POSTGRES_PASSWORD"),
+		os.Getenv("POSTGRES_DB"),
+	)
 
-	// 3. Инициализация сервисов: бизнес-логика (работа с данными)
-	bookingService := &service.BookingService{DB: db} // Логика бронирования
-	userService := &service.UserService{DB: db}       // Логика пользователей
-
-	// FSM (Finite State Machine) — для пошаговых диалогов (например: выбор даты -> времени -> услуг)
-	fsmService := fsm.NewFSM(rdb)
-
-	// 4. Инициализация Telegram API: устанавливаем связь с сервером Telegram
-	botAPI, err := tgbotapi.NewBotAPI(cfg.BotToken)
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		log.Fatal(err)
+		log.Panic("Ошибка при попытке открыть БД: ", err)
+	}
+	defer db.Close()
+
+	// Проверка связи с БД
+	if err := db.Ping(); err != nil {
+		log.Panic("База данных недоступна: ", err)
+	}
+	log.Println("Подключение к БД успешно установлено!")
+
+	// 3. Инициализация API бота
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if token == "" {
+		log.Fatal("TELEGRAM_BOT_TOKEN не задан в .env")
 	}
 
-	// 5. Инициализация под-хендлеров: создаем объекты, которые будут отвечать за разные части бота
-	menuHandler := menu.NewHandlerMenu(botAPI, bookingService, userService)               // Отвечает за меню
-	adminHandler := admin.NewHandler(botAPI, bookingService, userService)                 // Отвечает за админку
-	bookingHandler := booking.NewHandler(botAPI, bookingService, userService, fsmService) // Отвечает за запись
-
-	// 6. Создание Роутера: "диспетчер", который решает, какой хендлер должен обрабатывать запрос
-	router := &bot.Router{
-		Menu:    menuHandler,
-		Admin:   adminHandler,
-		Booking: bookingHandler,
+	api, err := tgbotapi.NewBotAPI(token)
+	if err != nil {
+		log.Panic("Ошибка инициализации бота: ", err)
 	}
 
-	// 7. Создание главного обработчика: точка входа для всех обновлений из Telegram
+	// 4. Сборка слоев (Dependency Injection)
+	repo := repository.NewRepository(db)
+	svc := service.NewService(repo)
 	handler := &bot.Handler{
-		Bot:    botAPI,
-		Router: router,
+		Bot:     api,
+		Service: svc,
 	}
 
-	// 8. Запуск бота: создаем канал для получения обновлений (сообщений, нажатий кнопок)
+	// 5. Запуск получения обновлений
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-	updates := botAPI.GetUpdatesChan(u)
+	updates := api.GetUpdatesChan(u)
 
-	log.Println("Bot started!")
-	// Главный цикл: бесконечно слушаем новые сообщения и передаем их в handler
+	log.Printf("Бот успешно запущен как @%s", api.Self.UserName)
+
 	for update := range updates {
-		handler.Handle(update)
+		// Передаем обновление в наш обработчик
+		handler.HandleUpdate(update)
 	}
-
-	// В main.go, после инициализации бота и сервисов:
-	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
-		for range ticker.C {
-			// Проверяем записи, которые закончились более 1 часа назад
-			threshold := time.Now().Add(-1 * time.Hour)
-			appointments, err := bookingService.GetFinishedAppointments(threshold)
-			if err != nil {
-				log.Println("Ошибка при поиске записей для отзыва:", err)
-				continue
-			}
-
-			for _, app := range appointments {
-				// ИСПРАВЛЕНИЕ: вызываем функцию (ее нужно определить ниже)
-				booking.SendReviewRequest(botAPI, app)
-
-				// ИСПРАВЛЕНИЕ: используем экземпляр bookingService
-				bookingService.MarkReviewSent(app.ID)
-			}
-		}
-	}()
 }
